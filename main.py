@@ -1,60 +1,29 @@
-"""gta6-twitch-ccu-forecast-01 entry: launch-day Twitch CCU forecast, hours 2..24.
+"""GTA VI launch-day Twitch CCU forecast, hours 2..24 -- entry v2.
 
-Model (built from the practice data, not from the starter):
-  A rolling-midnight console launch has a shape the hour-1 print alone cannot
-  see: hour 1 (00:00-01:00 UTC) covers only the regions already unlocked
-  (NZ/Asia/Europe), the US unlocks at 04:00/05:00 UTC, and the audience then
-  climbs to an evening peak (hours 18-22) before easing off. Across ALL past
-  launches hour 1 says almost nothing about the late hours, but inside the
-  family that matters -- console launches with a rolling midnight unlock and
-  no early access -- hour 1 predicts the whole day well: the log-log slope
-  of hour-h viewers on hour-1 viewers stays 0.5-1.1 all day there.
+Same forecaster as v1, with exactly one change. v1 fits every hour on one
+nine-game family: console launches with a rolling midnight unlock, no early
+access, plus shape-consistent console-only additions. v2 keeps that family
+for most hours, but fits hours 10..14 on a narrower console-only family:
+the rolling-midnight, tier-comparable launches with no PC release, plus the
+same shape gate (RMSE <= 0.20 against the console family's median curve)
+that admits Ghost of Tsushima and rejects Saros and Stellar Blade.
 
-  So the forecast is built from that family only:
-  1. Core set: comparables whose unlock note says tier "comparable" and a
-     rolling midnight unlock, with no "early access" in the note. Early
-     access, simultaneous global unlocks, free-to-play and the target game's
-     own pre-release history are all excluded: their hour 1 means something
-     else entirely (already unlocked / not yet unlocked / not a launch).
-  2. Shape-consistent additions: an unverified console-only comparable joins
-     the set only if its whole log-ratio curve sits close (RMSE <= 0.20) to
-     the core set's median curve. This admits Ghost of Tsushima (RMSE 0.11,
-     the closest curve in the set) and keeps out Saros (0.65) and Stellar
-     Blade (0.33).
-  3. Two median estimators per hour, blended in log space (0.7 / 0.3):
-     (a) Theil-Sen (median pairwise slope, robust to a wild launch like
-         Resident Evil Requiem's 12x peak) of log viewers_h on log viewers_1.
-     (b) Peak-anchored: OLS of log peak on log hour-1, times the median
-         peak-normalised shape log(viewers_h / peak). This is the estimator
-         that is strongest on the mid-size launches.
-     Each carries its own spread: 0.8 x its residual (or shape) standard
-     deviation, floored at 0.15 log units, as the log-normal sigma behind
-     the five quantiles.
-  4. DST alignment of the US-midnight jump. The day's sharpest rise is the
-     US Eastern midnight unlock: 04:00 UTC while the US is on daylight time
-     (hour 5), 05:00 UTC on standard time (hour 6). Before fitting, every
-     comparable's curve is shifted by -1, 0 or +1 hours so its own detected
-     jump (largest log rise, hours 4-7) lands on the target case's jump
-     hour, computed from the release date by the US daylight-saving rule;
-     hour 1 stays the anchor and is never shifted. Without this the jump
-     smears across hours 5-6; with it the practice loss drops a little
-     further and the November final (standard time, jump at hour 6) gets a
-     sharp jump in the right place.
-  5. Guardrails, from the subset's own observed ranges (they never bind on
-     the practice cases, they only stop absurd extrapolation on a game
-     bigger than anything in the set): each hour's median log-ratio is
-     clamped to [min - 0.10, max + 0.10] of the subset, and the day's peak
-     median is floored at the hour-1 print (every rolling launch peaks at
-     or above hour 1 -- the US unlock can only add audience), lifting
-     hours 6..24 if needed.
+Why only midday: launches that also shipped on PC stay flatter through the
+middle of the day (the PC audience in Asia/Europe keeps playing), while
+console-only launches dip deeper there, and the true midday level of three
+of the four practice cases sits closer to the console-only level. The
+evening peak and the early climb keep the wider nine-game family, which is
+what anchors the level for small hour-1 prints.
 
-  If anything about a case is unusable, the program falls back to the flat
-  persistence forecast with a random-walk spread, and still writes a valid
-  file: an invalid case scores far worse than a mediocre valid one.
+Everything else is v1 unchanged: two median estimators per hour blended
+0.7/0.3 in log space (Theil-Sen of log viewers on log hour-1, and a
+peak-anchored OLS shape), spread 0.8 x residual/shape std floored at 0.15,
+US-midnight jump aligned for daylight saving, per-hour guardrail clamps
+taken from whichever family fits that hour, a peak floor at the hour-1
+print, and a flat persistence fallback when a case cannot be fitted.
 
-  Practice (local scorer, ground truth from SullyGnome): loss 0.1362
-  (p00 0.1520, p01 0.1075, p02 0.0900, p03 0.1953) vs house baseline 0.3871
-  and the practice rank-1 bar 0.146. Deterministic, stdlib only, no network.
+Practice (local scorer): loss 0.1306 (p00 0.1410, p01 0.1163, p02 0.0802,
+p03 0.1850) vs v1 0.1362. Deterministic, stdlib only, no network.
 """
 
 import json
@@ -65,44 +34,43 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-1.6448536269514722, -0.6744897501960817, 0.0, 0.6744897501960817, 1.6448536269514722]
+QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
+Z_SCORES = [-1.6448536269514722, -0.6744897501960817, 0.0,
+            0.6744897501960817, 1.6448536269514722]
 
-# Blend weight on the Theil-Sen component; spread multiplier on residual std.
-W_TS = 0.7
-SPREAD_K = 0.8
-SPREAD_FLOOR = 0.15
-# Shape-consistency gate for unverified console-only additions (RMSE of the
-# log-ratio curve against the core set's median curve).
-SHAPE_RMSE_MAX = 0.20
-# Guardrail margin around the subset's observed per-hour log-ratio range.
-RANGE_MARGIN = 0.10
+TS_WEIGHT = 0.7          # weight on the Theil-Sen estimator in the blend
+SPREAD_MULT = 0.8        # sigma = SPREAD_MULT * residual std
+SPREAD_MIN = 0.15        # floor on sigma, in log units
+SHAPE_RMSE_LIMIT = 0.20  # shape gate for unverified console-only additions
+CLAMP_MARGIN = 0.10      # guardrail margin around a family's observed range
+MIDDAY_FIRST = 10        # first hour fitted on the console-only family
+MIDDAY_LAST = 14         # last hour fitted on the console-only family
 
 
-def median(xs):
-    s = sorted(xs)
-    n = len(s)
+def _median(values):
+    ordered = sorted(values)
+    n = len(ordered)
     if n == 0:
         return 0.0
-    mid = n // 2
-    return s[mid] if n % 2 else 0.5 * (s[mid - 1] + s[mid])
+    half = n // 2
+    if n % 2:
+        return ordered[half]
+    return 0.5 * (ordered[half - 1] + ordered[half])
 
 
-def pstdev(xs):
-    n = len(xs)
+def _pstdev(values):
+    n = len(values)
     if n < 2:
         return 0.0
-    m = sum(xs) / n
-    return math.sqrt(sum((x - m) ** 2 for x in xs) / n)
+    mean = sum(values) / n
+    return math.sqrt(sum((v - mean) ** 2 for v in values) / n)
 
 
-def ols(xs, ys):
-    """Ordinary least squares y ~ a + b*x; returns (a, b)."""
+def _ols(xs, ys):
+    """Least-squares fit y ~ a + b*x, returning (a, b)."""
     n = len(xs)
     mx = sum(xs) / n
     my = sum(ys) / n
@@ -113,78 +81,76 @@ def ols(xs, ys):
     return my - b * mx, b
 
 
-def theil_sen(xs, ys):
-    """Median pairwise slope with median intercept; robust to one wild launch."""
+def _theil_sen(xs, ys):
+    """Median pairwise slope, intercept as median residual; robust to outliers."""
     slopes = []
     n = len(xs)
     for i in range(n):
-        xi, yi = xs[i], ys[i]
         for j in range(i + 1, n):
-            if xs[j] != xi:
-                slopes.append((ys[j] - yi) / (xs[j] - xi))
+            if xs[j] != xs[i]:
+                slopes.append((ys[j] - ys[i]) / (xs[j] - xs[i]))
     if not slopes:
-        return median(ys), 0.0
-    b = median(slopes)
-    return median([y - b * x for x, y in zip(xs, ys)]), b
+        return _median(ys), 0.0
+    slope = _median(slopes)
+    return _median([y - slope * x for x, y in zip(xs, ys)]), slope
 
 
-def round2(x):
-    """Round to 2 decimals, half up (same convention as the house starter)."""
-    scaled = x * 100.0
+def _round2(value):
+    """Round to 2 decimals, halves up (same convention as the house starter)."""
+    scaled = value * 100.0
     whole = math.floor(scaled)
     if scaled - whole >= 0.5:
         whole += 1
-    value = whole / 100.0
-    return int(value) if value == int(value) else value
+    out = whole / 100.0
+    return int(out) if out == int(out) else out
 
 
-def parse_ts(text):
+def _parse_ts(text):
     try:
         return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ")
     except (TypeError, ValueError):
         return None
 
 
-def parse_tier(unlock_text):
-    m = re.search(r"Tier:\s*([A-Za-z\-]+)", unlock_text or "")
+def _tier(note):
+    m = re.search(r"Tier:\s*([A-Za-z\-]+)", note or "")
     return m.group(1).lower() if m else ""
 
 
-def unlock_kind(unlock_text):
-    """Classify a comparable's unlock from its free-text note."""
-    t = (unlock_text or "").lower()
-    if "early access" in t:
+def _unlock_kind(note):
+    """Rolling / simultaneous / early / unverified, from the free-text note."""
+    text = (note or "").lower()
+    if "early access" in text:
         return "early"
-    if "rolling" in t or "midnight local" in t:
+    if "rolling" in text or "midnight local" in text:
         return "rolling"
-    if "simultaneous" in t or "single global" in t:
+    if "simultaneous" in text or "single global" in text:
         return "simultaneous"
     return "unverified"
 
 
-def target_jump_hour(day_start):
-    """The US Eastern midnight unlock's hour (1-based) on the release day.
+def _us_jump_hour(day_start):
+    """Hour (1-based) of the US Eastern midnight unlock on the release day.
 
-    04:00 UTC (hour 5) while the US is on daylight time, 05:00 UTC (hour 6)
-    on standard time. US daylight time runs from the 2nd Sunday of March
-    to the 1st Sunday of November. Returns None when the date is unusable.
+    04:00 UTC (hour 5) under US daylight time, 05:00 UTC (hour 6) under
+    standard time. Daylight time runs from the 2nd Sunday of March to the
+    1st Sunday of November. None when the date cannot be parsed.
     """
-    d = parse_ts(day_start or "")
-    if d is None:
+    day = _parse_ts(day_start or "")
+    if day is None:
         return None
 
     def nth_sunday(year, month, n):
         first = datetime(year, month, 1)
-        offset = (6 - first.weekday()) % 7
-        return first + timedelta(days=offset + 7 * (n - 1))
+        return first + timedelta(days=(6 - first.weekday()) % 7 + 7 * (n - 1))
 
-    dst_start = nth_sunday(d.year, 3, 2).date()
-    dst_end = nth_sunday(d.year, 11, 1).date()
-    return 5 if dst_start <= d.date() < dst_end else 6
+    dst_start = nth_sunday(day.year, 3, 2).date()
+    dst_end = nth_sunday(day.year, 11, 1).date()
+    return 5 if dst_start <= day.date() < dst_end else 6
 
 
-def detect_jump(series):
-    """Hour (1-based, in 4..7) of the series' sharpest log rise: its US unlock."""
+def _jump_hour(series):
+    """Hour in 4..7 with the sharpest log rise: the comparable's US unlock."""
     best_hour, best_rise = 5, None
     for h in range(4, 8):
         if h in series and h - 1 in series and series[h - 1] > 0:
@@ -194,161 +160,163 @@ def detect_jump(series):
     return best_hour
 
 
-def align_subset(subset, target_jump):
-    """Shift each comparable's curve so its detected jump lands on target_jump.
+def _align(family, target_jump):
+    """Shift each comparable so its detected jump lands on target_jump.
 
-    Hour 1 is the anchor and is never shifted; hours that fall off the
-    1..24 edge are dropped for that comparable. Returns new dicts.
+    Hour 1 is the anchor and never moves; an hour that would fall off the
+    1..24 edge keeps its own value instead of disappearing.
     """
     if target_jump is None:
-        return subset
-    out = []
-    for c in subset:
-        jump = detect_jump(c["series"])
-        shift = target_jump - jump
+        return family
+    aligned = []
+    for comp in family:
+        shift = target_jump - _jump_hour(comp["series"])
         series = {}
         for h in range(1, 25):
             src = h - shift
-            if 1 <= src <= 24 and src in c["series"]:
-                series[h] = c["series"][src]
-            elif h in c["series"]:
-                # Edge hour that falls off the 1..24 window keeps its own
-                # value instead of disappearing: the tail is the least
-                # jump-sensitive part of the curve.
-                series[h] = c["series"][h]
-        series[1] = c["p1"]
-        out.append({"p1": c["p1"], "series": series})
-    return out
+            if 1 <= src <= 24 and src in comp["series"]:
+                series[h] = comp["series"][src]
+            elif h in comp["series"]:
+                series[h] = comp["series"][h]
+        series[1] = comp["p1"]
+        aligned.append({"p1": comp["p1"], "series": series})
+    return aligned
 
 
-def release_day_series(comp):
-    """Hourly viewers for the 24 UTC hours of the comparable's release day.
-
-    Returns a dict hour (1..24) -> viewers, using only positive prints.
-    """
-    day0 = parse_ts(comp.get("day_start", ""))
+def _day_series(comp):
+    """Hourly viewers (hours 1..24) on the comparable's release day."""
+    day0 = _parse_ts(comp.get("day_start", ""))
     if day0 is None:
         return {}
     out = {}
     for row in comp.get("hourly") or []:
-        t = parse_ts(row.get("from", ""))
-        v = row.get("viewers")
-        if t is None or not isinstance(v, (int, float)) or v <= 0:
+        when = _parse_ts(row.get("from", ""))
+        viewers = row.get("viewers")
+        if when is None or not isinstance(viewers, (int, float)) or viewers <= 0:
             continue
-        h = int((t - day0).total_seconds() // 3600) + 1
+        h = int((when - day0).total_seconds() // 3600) + 1
         if 1 <= h <= 24:
-            out[h] = float(v)
+            out[h] = float(viewers)
     return out
 
 
-def build_subset(comparables):
-    """The launch family the forecast is fitted on.
+def _median_log_ratio(family, hour):
+    vals = [math.log(c["series"][hour] / c["p1"])
+            for c in family if hour in c["series"]]
+    return _median(vals) if vals else None
 
-    Core: tier comparable + rolling midnight unlock + no early access.
-    Plus unverified console-only comparables whose log-ratio curve is
-    close to the core median curve. Returns a list of (p1, {hour: viewers}).
+
+def _build_family(comparables, console_only_core):
+    """The launch family a fit is taken from.
+
+    Core: tier "comparable" + rolling midnight unlock. With
+    console_only_core the core is additionally restricted to launches with
+    no PC release. On top of the core, an unverified console-only
+    comparable joins when its whole log-ratio curve is close (RMSE <= 0.20)
+    to the core's median curve.
     """
     parsed = []
     for comp in comparables:
-        series = release_day_series(comp)
+        series = _day_series(comp)
         if 1 not in series or len(series) < 18:
             continue
-        tier = parse_tier(comp.get("unlock", ""))
-        kind = unlock_kind(comp.get("unlock", ""))
-        console_only = "PC" not in (comp.get("platforms") or "")
         parsed.append({
             "p1": series[1],
             "series": series,
-            "tier": tier,
-            "kind": kind,
-            "console_only": console_only,
+            "tier": _tier(comp.get("unlock", "")),
+            "kind": _unlock_kind(comp.get("unlock", "")),
+            "console_only": "PC" not in (comp.get("platforms") or ""),
         })
     core = [c for c in parsed
-            if c["tier"] == "comparable" and c["kind"] == "rolling"]
+            if c["tier"] == "comparable" and c["kind"] == "rolling"
+            and (c["console_only"] or not console_only_core)]
     if len(core) < 4:
         core = [c for c in parsed
-                if c["tier"] == "comparable" and c["kind"] != "early"]
+                if c["tier"] == "comparable" and c["kind"] != "early"
+                and (c["console_only"] or not console_only_core)]
     if len(core) < 3:
-        core = [c for c in parsed if c["tier"] not in ("early-access-contaminated", "weak", "target-history")]
+        core = [c for c in parsed
+                if c["tier"] not in ("early-access-contaminated", "weak",
+                                     "target-history")
+                and (c["console_only"] or not console_only_core)]
     if len(core) < 3:
-        return [c for c in parsed]
+        return [c for c in parsed
+                if c["console_only"] or not console_only_core]
 
-    def log_ratios(c):
-        return {h: math.log(v / c["p1"]) for h, v in c["series"].items() if h >= 2}
-
-    core_med = {}
+    family = list(core)
+    # Median log-ratio curve of the core, computed once and reused by the
+    # shape gate for every unverified candidate.
+    core_curve = {}
     for h in range(2, 25):
-        vals = [math.log(c["series"][h] / c["p1"]) for c in core if h in c["series"]]
-        if vals:
-            core_med[h] = median(vals)
-
-    subset = list(core)
+        med = _median_log_ratio(core, h)
+        if med is not None:
+            core_curve[h] = med
     for c in parsed:
-        if c in core or c in subset:
+        if c in core or c in family:
             continue
-        if c["tier"] != "comparable" or c["kind"] != "unverified" or not c["console_only"]:
+        if c["tier"] != "comparable" or c["kind"] != "unverified":
             continue
-        lr = log_ratios(c)
-        common = [h for h in lr if h in core_med]
+        if not c["console_only"]:
+            continue
+        ratios = {h: math.log(v / c["p1"])
+                  for h, v in c["series"].items() if h >= 2}
+        common = [h for h in ratios if h in core_curve]
         if len(common) < 12:
             continue
-        rmse = math.sqrt(sum((lr[h] - core_med[h]) ** 2 for h in common) / len(common))
-        if rmse <= SHAPE_RMSE_MAX:
-            subset.append(c)
-    return subset
+        rmse = math.sqrt(sum((ratios[h] - core_curve[h]) ** 2
+                             for h in common) / len(common))
+        if rmse <= SHAPE_RMSE_LIMIT:
+            family.append(c)
+    return family
 
 
-def fit_theil_sen(subset, p1):
-    """Per hour: Theil-Sen log(v_h) ~ log(p1). Returns {h: (log_median, sigma)}."""
-    lp1 = math.log(p1)
+def _fit_theil_sen(family, p1):
+    """Per hour: Theil-Sen log(viewers_h) ~ log(p1). Returns {h: (log_med, sigma)}."""
+    log_p1 = math.log(p1)
     out = {}
     for h in range(2, 25):
         xs, ys = [], []
-        for c in subset:
+        for c in family:
             if h in c["series"]:
                 xs.append(math.log(c["p1"]))
                 ys.append(math.log(c["series"][h]))
         if len(xs) < 3:
             continue
-        a, b = theil_sen(xs, ys)
-        pred = a + b * lp1
+        a, b = _theil_sen(xs, ys)
         resid = [y - (a + b * x) for x, y in zip(xs, ys)]
-        out[h] = (pred, max(SPREAD_FLOOR, SPREAD_K * pstdev(resid)))
+        out[h] = (a + b * log_p1, max(SPREAD_MIN, SPREAD_MULT * _pstdev(resid)))
     return out
 
 
-def fit_peak_anchored(subset, p1):
-    """Per hour: OLS log(peak) ~ log(p1), times median peak-normalised shape."""
-    lp1 = math.log(p1)
+def _fit_peak_anchored(family, p1):
+    """Per hour: OLS log(peak) ~ log(p1), times the median peak-normalised shape."""
+    log_p1 = math.log(p1)
     xs, peaks = [], []
-    for c in subset:
+    for c in family:
         xs.append(math.log(c["p1"]))
         peaks.append(max(c["series"].values()))
     if len(xs) < 3:
         return {}
-    a, b = ols(xs, [math.log(p) for p in peaks])
-    log_peak = a + b * lp1
+    a, b = _ols(xs, [math.log(p) for p in peaks])
+    log_peak = a + b * log_p1
     out = {}
     for h in range(2, 25):
         shapes = [math.log(c["series"][h] / max(c["series"].values()))
-                  for c in subset if h in c["series"]]
+                  for c in family if h in c["series"]]
         if not shapes:
             continue
-        out[h] = (log_peak + median(shapes),
-                  max(SPREAD_FLOOR, SPREAD_K * pstdev(shapes)))
+        out[h] = (log_peak + _median(shapes),
+                  max(SPREAD_MIN, SPREAD_MULT * _pstdev(shapes)))
     return out
 
 
-def persistence_rows(p1):
-    """Flat fallback: every hour at hour 1, random-walk spread."""
-    rows = {}
-    for h in range(2, 25):
-        s = 0.15 * math.sqrt(h - 1)
-        rows[h] = [round2(p1 * math.exp(z * s)) for z in Z]
-    return rows
+def _persistence(p1):
+    """Flat fallback: every hour at hour 1, with a random-walk spread."""
+    return {h: [_round2(p1 * math.exp(z * 0.15 * math.sqrt(h - 1)))
+                for z in Z_SCORES] for h in range(2, 25)}
 
 
-def forecast_case(case):
+def _forecast(case):
     """Return {hour: [q05, q25, q50, q75, q95]} for hours 2..24."""
     try:
         known = case.get("known") or []
@@ -360,46 +328,45 @@ def forecast_case(case):
         p1 = 1.0
 
     try:
-        subset = build_subset(case.get("comparables") or [])
-        target = target_jump_hour(case.get("day_start", ""))
+        wide = _build_family(case.get("comparables") or [], False)
+        narrow = _build_family(case.get("comparables") or [], True)
+        target = _us_jump_hour(case.get("day_start", ""))
         if target is None:
-            jumps = [detect_jump(c["series"]) for c in subset]
-            target = median(jumps) if jumps else 5
-        subset = align_subset(subset, target)
-        ts_fit = fit_theil_sen(subset, p1)
-        pa_fit = fit_peak_anchored(subset, p1)
-        hours = [h for h in range(2, 25) if h in ts_fit and h in pa_fit]
-        if len(hours) < 12:
+            jumps = [_jump_hour(c["series"]) for c in wide]
+            target = _median(jumps) if jumps else 5
+        wide = _align(wide, target)
+        narrow = _align(narrow, target)
+        fits = {}
+        for h in range(2, 25):
+            family = narrow if MIDDAY_FIRST <= h <= MIDDAY_LAST else wide
+            ts_fit = _fit_theil_sen(family, p1)
+            pa_fit = _fit_peak_anchored(family, p1)
+            if h in ts_fit and h in pa_fit:
+                fits[h] = (family, ts_fit[h], pa_fit[h])
+        if len(fits) < 12:
             raise ValueError("too few fittable hours")
     except Exception:
-        return persistence_rows(p1)
+        return _persistence(p1)
 
-    # Blend the two estimators' quantiles in log space.
+    # Blend the two estimators' quantiles in log space, hour by hour.
     rows = {}
-    for h in range(2, 25):
-        if h in ts_fit and h in pa_fit:
-            m1, s1 = ts_fit[h]
-            m2, s2 = pa_fit[h]
-            qs = []
-            for z in Z:
-                lq1 = m1 + z * s1
-                lq2 = m2 + z * s2
-                qs.append(math.exp(W_TS * lq1 + (1.0 - W_TS) * lq2))
-            rows[h] = qs
+    for h, (family, (m1, s1), (m2, s2)) in fits.items():
+        rows[h] = [math.exp(TS_WEIGHT * (m1 + z * s1)
+                            + (1.0 - TS_WEIGHT) * (m2 + z * s2))
+                   for z in Z_SCORES]
     if len(rows) < 12:
-        return persistence_rows(p1)
+        return _persistence(p1)
 
-    # Guardrails, from the subset's own observed log-ratio ranges.
-    ranges = {}
-    for h in range(2, 25):
-        vals = [math.log(c["series"][h] / c["p1"]) for c in subset if h in c["series"]]
-        if vals:
-            ranges[h] = (min(vals) - RANGE_MARGIN, max(vals) + RANGE_MARGIN)
+    # Guardrails, from the fitting family's own observed log-ratio ranges.
     med_log = {}
     for h, qs in rows.items():
+        family = fits[h][0]
+        vals = [math.log(c["series"][h] / c["p1"])
+                for c in family if h in c["series"]]
         lr = math.log(qs[2] / p1)
-        if h in ranges:
-            lo, hi = ranges[h]
+        if vals:
+            lo = min(vals) - CLAMP_MARGIN
+            hi = max(vals) + CLAMP_MARGIN
             lr = max(lo, min(hi, lr))
         med_log[h] = lr
     peak_ratio = max(math.exp(v) for v in med_log.values())
@@ -408,18 +375,18 @@ def forecast_case(case):
         shift = med_log[h] + (lift if h >= 6 else 0.0) - math.log(qs[2] / p1)
         rows[h] = [q * math.exp(shift) for q in qs]
 
-    # Finalise: round, clamp to (0, 1e9], enforce non-decreasing.
+    # Finalise: round, keep in (0, 1e9], enforce non-decreasing quantiles.
     final = {}
     for h in range(2, 25):
         qs = rows.get(h)
         if qs is None:
-            qs = [round2(p1 * math.exp(z * 0.15 * math.sqrt(h - 1))) for z in Z]
+            qs = [p1 * math.exp(z * 0.15 * math.sqrt(h - 1)) for z in Z_SCORES]
         out = []
         prev = 0.0
         for q in qs:
-            v = round2(q)
+            v = _round2(q)
             if not math.isfinite(v) or v <= 0:
-                v = round2(prev) if prev > 0 else 0.01
+                v = _round2(prev) if prev > 0 else 0.01
             v = min(v, 1e9)
             v = max(v, prev)
             out.append(v)
@@ -433,9 +400,9 @@ def main():
     for path in sorted(INPUT_DIR.glob("*.in")):
         try:
             case = json.loads(path.read_text(encoding="utf-8"))
-            rows = forecast_case(case)
+            rows = _forecast(case)
         except Exception:
-            rows = persistence_rows(1.0)
+            rows = _persistence(1.0)
         payload = {"hours": [{"hour": h, "q": rows[h]} for h in range(2, 25)]}
         text = json.dumps(payload, separators=(",", ":")) + "\n"
         (OUTPUT_DIR / f"{path.stem}.out").write_text(text, encoding="utf-8")
